@@ -1,40 +1,118 @@
-=================================================================</br>
-epoll_create</br>
-=================================================================</br>
+|******************************************************************|
+|*****			epoll_create                   ************|
+|******************************************************************|
 
 SYSCALL_DEFINE1(epoll_create, int, size)
 {
 	......
 	return sys_epoll_create1(0);
 }
-epoll_create主要调用了内核系统调用函数sys_epoll_create1.</br>
-而sys_epoll_create1的函数定义原型为SYSCALL_DEFINE1(epoll_create1, int, flags).</br>
+epoll_create主要调用了内核系统调用函数sys_epoll_create1.
+而sys_epoll_create1的函数定义原型为SYSCALL_DEFINE1(epoll_create1, int, flags).
 
 SYSCALL_DEFINE1(epoll_create1, int, flags)
 {
-	传递进来的flags为0, 为epoll_create传递的size大小没有起作用</br>
+	/* 传递进来的flags为0, 为epoll_create传递的size大小没有起作用 */
 	int error;
 	struct eventpoll *ep = NULL;
+	......
 
-	if (flags & ~EPOLL_CLOEXEC)
-		return -EINVAL;
-	/*
-	 * Create the internal data structure ("struct eventpoll").
-	 */
 	error = ep_alloc(&ep);
-	if (error < 0)
-		return error;
-	/*
-	 * Creates all the items needed to setup an eventpoll file. That is,
-	 * a file structure and a free file descriptor.
-	 */
+	/* eventpoll结构体主要在ep_alloc中开辟的. */
+
 	error = anon_inode_getfd("[eventpoll]", &eventpoll_fops, ep,
 				 flags & O_CLOEXEC);
-	if (error < 0)
-		ep_free(ep);
+	/* 在anon_inode_getfd中构造epoll_create返回的套接字的file和dentry资源 */
 
-	return error;
+	......
 }
 
+接上文中的函数调用,接下来是ep_alloc函数
+static int ep_alloc(struct eventpoll **pep)
+{
+	......
+	user = get_current_user();
+	/*get_current_user引用struct user_struct结构体(用户结构体), 此处不做讨论*/
 
+	ep = kzalloc(sizeof(*ep), GFP_KERNEL);
+	/* ep 为开辟的struct eventpoll结构体, 失败之后将调用free_uid*/
 
+	/* 锁的初始化 */
+	spin_lock_init(&ep->lock);
+	mutex_init(&ep->mtx);
+
+	/*初始化等待队列(基础结构为struct list_head), 一般sys_epoll_wait()函数用来使用*/
+	init_waitqueue_head(&ep->wq);
+	/*初始化等待队列(基础结构为struct list_head), 一般ile->poll()函数用来使用*/
+	init_waitqueue_head(&ep->poll_wait);
+
+	/*初始化就绪队列*/
+	INIT_LIST_HEAD(&ep->rdllist);
+
+	/* epoll的底层数据结构红黑树 */
+	ep->rbr = RB_ROOT;
+
+	/**/
+	ep->ovflist = EP_UNACTIVE_PTR;
+
+	/* 创建epoll的用户结构体*/
+	ep->user = user;
+
+	*pep = ep;
+	......
+
+free_uid:
+	/*释放引用计数,当引用为0时, 释放该结构, 此处不讨论*/
+	free_uid(user);
+	......
+}
+
+简单分析下anon_inode_getfd函数
+int anon_inode_getfd(const char *name, const struct file_operations *fops,
+		     void *priv, int flags)
+{
+	......
+
+	/*申请一个可用的fd descriptor结构, 此处不对此做讨论*/
+	error = get_unused_fd_flags(flags);
+	int fd = error;
+
+	/* 申请一个struct file结构和struct dentry结构 */
+	file = anon_inode_getfile(name, fops, priv, flags);
+
+	/*将申请的file结构体存储在对应的fd表中*/
+	fd_install(fd, file);
+
+	......
+}
+
+函数anon_inode_getfile
+struct file *anon_inode_getfile(const char *name,
+				const struct file_operations *fops,
+				void *priv, int flags)
+{
+	struct dentry *dentry;
+	struct file *file;
+
+	.......
+
+	dentry = d_alloc(anon_inode_mnt->mnt_sb->s_root, &this);
+
+	/*此处使用了anon_inode_inode结构, 该结构为struct inode结构体, 引用计数加1*/
+	atomic_inc(&anon_inode_inode->i_count);
+
+	/*将对应的dentry 添加到anon_inode_inode结构中去*/
+	d_instantiate(dentry, anon_inode_inode);
+
+	file = alloc_file(anon_inode_mnt, dentry,
+			  FMODE_READ | FMODE_WRITE, fops);
+
+	file->f_mapping = anon_inode_inode->i_mapping;
+	file->f_pos = 0;
+	file->f_flags = O_RDWR | (flags & O_NONBLOCK);
+	file->f_version = 0;
+	/*将之前开辟的ep(struct eventpoll 结构体)加入到了该file的私有数据结构中*/
+	file->private_data = priv;
+
+	......
+}
