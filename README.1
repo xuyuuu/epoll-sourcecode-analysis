@@ -116,3 +116,15 @@ struct file *anon_inode_getfile(const char *name,
 
 	......
 }
+
+fd_install函数
+void fd_install(unsigned int fd, struct file *file)
+{
+	struct files_struct *files = current->files;
+	struct fdtable *fdt;
+
+	/*fd descriptor表*/
+	fdt = files_fdtable(files);
+	/*将对应的struct file结构体指针插入到fd表中*/
+	rcu_assign_pointer(fdt->fd[fd], file);
+}
