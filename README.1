@@ -23,7 +23,15 @@ SYSCALL_DEFINE1(epoll_create1, int, flags)
 
 	error = anon_inode_getfd("[eventpoll]", &eventpoll_fops, ep,
 				 flags & O_CLOEXEC);
-	/* 在anon_inode_getfd中构造epoll_create返回的套接字的file和dentry资源 */
+	/* 在anon_inode_getfd中构造epoll_create返回的套接字的file和dentry资源,此处给该fd的f_op参数
+	   赋值为event_poll_fops, 具体结构如下:
+
+		static const struct file_operations eventpoll_fops = {
+			.release= ep_eventpoll_release,
+			.poll	= ep_eventpoll_poll
+		};	
+
+	*/
 
 	......
 }
@@ -44,7 +52,7 @@ static int ep_alloc(struct eventpoll **pep)
 
 	/*初始化等待队列(基础结构为struct list_head), 一般sys_epoll_wait()函数用来使用*/
 	init_waitqueue_head(&ep->wq);
-	/*初始化等待队列(基础结构为struct list_head), 一般ile->poll()函数用来使用*/
+	/*初始化等待队列(基础结构为struct list_head), 一般file->poll()函数用来使用*/
 	init_waitqueue_head(&ep->poll_wait);
 
 	/*初始化就绪队列*/

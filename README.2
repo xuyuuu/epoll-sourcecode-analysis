@@ -2,6 +2,313 @@
 |*****			epoll_ctl                      ************|
 |******************************************************************|
 epoll_ctl主要是将其他的需要监听的套接字加入到epoll_create创建的监听事件中去
+针对在epoll_ctl函数中添加的套接字类型是否具有poll函数指针一说, 可在下面进行分析.
+static int sock_attach_fd(struct socket *sock, struct file *file, int flags)
+{
+	......
+
+	/*此处使用了socket_file_ops结构体,该结构体就可以使用epoll和poll函数*/
+	init_file(file, sock_mnt, dentry, FMODE_READ | FMODE_WRITE,
+		  &socket_file_ops);
+	SOCK_INODE(sock)->i_fop = &socket_file_ops;
+
+	......
+}
+
+以上的sock_attach_fd是在socket系统调用源码中调用的, 此处赋值的是socket_file_ops结构体, socket_file_ops结构体如下：
+static const struct file_operations socket_file_ops = {
+	......
+
+	.poll =		sock_poll,
+
+	......
+};
+在该结构体中对poll函数进行了赋值, 既为sock_poll. 由此看出socket生成的fd是可以正常添加进epoll_ctl函数中的.
+而在系统调用open中,调用__dentry_open函数.
+static struct file *__dentry_open(struct dentry *dentry, struct vfsmount *mnt,
+					int flags, struct file *f,
+					int (*open)(struct inode *, struct file *),
+					const struct cred *cred)
+{
+	......
+
+	/*file结构体中的f_op是从inode结构体中的i_fop元素赋值过来的,inode结构中的i_fop一般跟文件系统类型相关*/
+	f->f_op = fops_get(inode->i_fop);
+
+	......
+}
+以ext3文件系统为例, ext3的file_operations结构体如下
+const struct file_operations ext3_file_operations = {
+	.llseek		= generic_file_llseek,
+	.read		= do_sync_read,
+	.write		= do_sync_write,
+	.aio_read	= generic_file_aio_read,
+	.aio_write	= generic_file_aio_write,
+	.unlocked_ioctl	= ext3_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= ext3_compat_ioctl,
+#endif
+	.mmap		= generic_file_mmap,
+	.open		= generic_file_open,
+	.release	= ext3_release_file,
+	.fsync		= ext3_sync_file,
+	.splice_read	= generic_file_splice_read,
+	.splice_write	= generic_file_splice_write,
+};
+该结构体中没有poll函数的支持,则一般的open产生的跟具体磁盘inode相关的fd描述符是不能添加进epoll_ctl中的.
+
+接下来正式分析epoll_ctl函数.
+SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
+		struct epoll_event __user *, event)
+{
+	struct file *file, *tfile;
+	struct eventpoll *ep;
+	struct epitem *epi;
+	struct epoll_event epds;
+
+	/*ep_op_has_event里面主要用来判断op类型是否为EPOLL_CTL_DEL
+	  要是delete类型的话, 就不用对参数epoll_event进行拷贝了,否则需要拷贝到内核结构体中*/
+	if (ep_op_has_event(op) &&
+	    copy_from_user(&epds, event, sizeof(struct epoll_event)))
+		.......
+
+	/* 从epoll_create创建的fd中, 获取其对应的file结构体  */
+	file = fget(epfd);
+	......
+
+	/*拿到参数中传入的添加fd对应的file结构体*/
+	tfile = fget(fd);
+
+	/*判断该file类型是否有f_op操作, 同时是否是具有poll函数, 对于普通的文件套接字, 在此处报错*/
+	if (!tfile->f_op || !tfile->f_op->poll)
+		goto ...... 
+
+	/* 如果加入到主监听fd(epoll_create创建的)中的是他本身, 则加入失败  */
+	if (file == tfile || !is_file_epoll(file))
+		goto .......
+
+	/*拿到eventpoll结构体*/
+	ep = file->private_data;
+
+	/*在红黑树中查找即将监听的fd, 看是否已经存在*/
+	epi = ep_find(ep, tfile, fd);
+
+	switch (op) {
+	case EPOLL_CTL_ADD:
+		/*如果已经存在, 并且操作时添加操作, 就不用再添加到红黑树中了*/
+		if (!epi) {
+			epds.events |= POLLERR | POLLHUP;
+			/*不存在的的时候执行插入红黑树的操作*/
+			error = ep_insert(ep, &epds, tfile, fd);
+		} else
+			error = -EEXIST;
+		break;
+	case EPOLL_CTL_DEL:
+		/*如果是删除操作, 红黑树中已经存在, 则直接进行删除*/
+		if (epi)
+			error = ep_remove(ep, epi);
+		/*不存在于红黑树中, 无需进行删除*/
+		else
+			error = -ENOENT;
+		break;
+	case EPOLL_CTL_MOD:
+		/*如果已经存在, 则进行更改*/
+		if (epi) {
+			epds.events |= POLLERR | POLLHUP;
+			error = ep_modify(ep, epi, &epds);
+		} else
+			error = -ENOENT;
+		break;
+	}
+		
+	......
+}
+
+传递给ep_find函数的第二个参数是待监听的fd的file结构体指针, 第三个参数是待监听的fd.
+其中ep_find中主要涉及到的结构体如下:
+struct epoll_filefd {
+	struct file *file;
+	int fd;
+};
+
+/*红黑树的节点*/
+struct rb_node
+{
+	unsigned long  rb_parent_color;
+#define	RB_RED		0
+#define	RB_BLACK	1
+	struct rb_node *rb_right;/*左孩子指针*/
+	struct rb_node *rb_left;/*右孩子指针*/
+} __attribute__((aligned(sizeof(long))));
+
+/*红黑树的根节点*/
+struct rb_root
+{
+	struct rb_node *rb_node;
+};
+
+struct epitem {
+	/*rbn 主要是连接在红黑树中的节点*/
+	struct rb_node rbn;
+
+	/*主要用来连接epoll事件中的ready list*/
+	struct list_head rdllink;
+
+	/*
+	 * Works together "struct eventpoll"->ovflist in keeping the
+	 * single linked chain of items.
+	 */
+	struct epitem *next;
+
+	/* 某个待监听的fd的file descriptor */
+	struct epoll_filefd ffd;
+
+	/*  */
+	int nwait;
+
+	/* List containing poll wait queues */
+	struct list_head pwqlist;
+
+	/* eventpoll指针 */
+	struct eventpoll *ep;
+
+	/*  */
+	struct list_head fllink;
+
+	/* 描述感兴趣的事件 */
+	struct epoll_event event;
+};
+
+ep_find主要用来查找当前插入的fd套接字是否已经在epoll监听的红黑树中.
+static struct epitem *ep_find(struct eventpoll *ep, struct file *file, int fd)
+{
+	int kcmp;
+	struct rb_node *rbp;
+	struct epitem *epi, *epir = NULL;
+	struct epoll_filefd ffd;
+
+	ep_set_ffd(&ffd, file, fd);
+	/*遍历红黑树,*/
+	for (rbp = ep->rbr.rb_node; rbp; ) {
+		epi = rb_entry(rbp, struct epitem, rbn);
+		/*红黑树中的比较函数, 以file结构体指针和fd大小进行比较*/
+		kcmp = ep_cmp_ffd(&ffd, &epi->ffd);
+		if (kcmp > 0)
+			rbp = rbp->rb_right;
+		else if (kcmp < 0)
+			rbp = rbp->rb_left;
+		else {
+			/*在红黑树中找到了要插入的fd套接字*/
+			epir = epi;
+			break;
+		}
+	}
+
+	return epir;
+}
 
 
+ep_insert是插入操作
+static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
+		     struct file *tfile, int fd)
+{
+	int error, revents, pwake = 0;
+	unsigned long flags;
+	struct epitem *epi;
+	struct ep_pqueue epq;
 
+	/*epoll_watches主要用于表示当前eventpoll中插入的fd事件数量, 不能查过最大值
+	在eventpoll_init中对epoll_watches进行了赋值, 可以占用整个用户空间的4%*/
+	if (unlikely(atomic_read(&ep->user->epoll_watches) >=
+		     max_user_watches))
+		return -ENOSPC;
+
+
+	if (!(epi = kmem_cache_alloc(epi_cache, GFP_KERNEL)))
+		return -ENOMEM;
+
+	/* Item initialization follow here ... */
+	INIT_LIST_HEAD(&epi->rdllink);
+	INIT_LIST_HEAD(&epi->fllink);
+	INIT_LIST_HEAD(&epi->pwqlist);
+	epi->ep = ep;
+	ep_set_ffd(&epi->ffd, tfile, fd);
+	epi->event = *event;
+	epi->nwait = 0;
+	epi->next = EP_UNACTIVE_PTR;
+
+	/* Initialize the poll table using the queue callback */
+	epq.epi = epi;
+	init_poll_funcptr(&epq.pt, ep_ptable_queue_proc);
+
+	/*
+	 * Attach the item to the poll hooks and get current event bits.
+	 * We can safely use the file* here because its usage count has
+	 * been increased by the caller of this function. Note that after
+	 * this operation completes, the poll callback can start hitting
+	 * the new item.
+	 */
+	revents = tfile->f_op->poll(tfile, &epq.pt);
+
+	/*
+	 * We have to check if something went wrong during the poll wait queue
+	 * install process. Namely an allocation for a wait queue failed due
+	 * high memory pressure.
+	 */
+	error = -ENOMEM;
+	if (epi->nwait < 0)
+		goto error_unregister;
+
+	/* Add the current item to the list of active epoll hook for this file */
+	spin_lock(&tfile->f_lock);
+	list_add_tail(&epi->fllink, &tfile->f_ep_links);
+	spin_unlock(&tfile->f_lock);
+
+	/*
+	 * Add the current item to the RB tree. All RB tree operations are
+	 * protected by "mtx", and ep_insert() is called with "mtx" held.
+	 */
+	ep_rbtree_insert(ep, epi);
+
+	/* We have to drop the new item inside our item list to keep track of it */
+	spin_lock_irqsave(&ep->lock, flags);
+
+	/* If the file is already "ready" we drop it inside the ready list */
+	if ((revents & event->events) && !ep_is_linked(&epi->rdllink)) {
+		list_add_tail(&epi->rdllink, &ep->rdllist);
+
+		/* Notify waiting tasks that events are available */
+		if (waitqueue_active(&ep->wq))
+			wake_up_locked(&ep->wq);
+		if (waitqueue_active(&ep->poll_wait))
+			pwake++;
+	}
+
+	spin_unlock_irqrestore(&ep->lock, flags);
+
+	atomic_inc(&ep->user->epoll_watches);
+
+	/* We have to call this outside the lock */
+	if (pwake)
+		ep_poll_safewake(&ep->poll_wait);
+
+	return 0;
+
+error_unregister:
+	ep_unregister_pollwait(ep, epi);
+
+	/*
+	 * We need to do this because an event could have been arrived on some
+	 * allocated wait queue. Note that we don't care about the ep->ovflist
+	 * list, since that is used/cleaned only inside a section bound by "mtx".
+	 * And ep_insert() is called with "mtx" held.
+	 */
+	spin_lock_irqsave(&ep->lock, flags);
+	if (ep_is_linked(&epi->rdllink))
+		list_del_init(&epi->rdllink);
+	spin_unlock_irqrestore(&ep->lock, flags);
+
+	kmem_cache_free(epi_cache, epi);
+
+	return error;
+}
