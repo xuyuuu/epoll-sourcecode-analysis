@@ -1,0 +1,45 @@
+
+********************************************************************
+*****	 		内核触发入口			       *****
+********************************************************************
+
+epoll机制是通过内核唤醒来进行触发的, 其基本的操作函数主要是sock_def_readable和sock_def_write_space.
+其中sock_def_readable是EPOLLIN的触发入口,sock_def_write_space是EPOLLOUT的触发入口.
+
+一般当有数据到来时候会执行sock_def_readable函数,
+缓冲区有空间可写入时候会执行sock_def_write_space函数
+
+sock_def_readble
+{
+	sk_has_sleeper(sk);	
+	其中的sk_has_sleeper函数主要用来判断当前sock套接字结构中的sk_sleep元素上是否有具体的挂载节点.
+	挂载点结构为wait_queue_head_t结构, 其中的task_list(struct list_head)为真正的挂载点.
+	每个挂载点都可以查找到对应的已加入的监听事件, 具体挂载操作在epoll_ctl函数中.
+	......
+	wake_up_interruptible_sync_poll --> 宏定义 __wake_up_sync_key
+	......
+}
+
+__wake_up_sync_key
+{
+	调用了__wake_up_common函数
+}
+
+__wake_up_common
+{
+	遍历sock结构中的sk_sleep上的task_list循环链表, 当当前的套接字缓冲区有数据时,需要遍历注册到该sk_sleep上的
+	所有的监听事件.
+	list_for_each_entry_safe(curr, next, &q->task_list, task_list) {
+
+		执行每一个wait_queue_t结构中的func函数, func函数也是在epoll_ctl中进行初始化的.
+		此处的func函数对应的函数为ep_poll_callback.
+		curr->func()	
+	}	
+}
+
+ep_poll_callback
+{
+	......	
+
+
+}
