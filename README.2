@@ -221,23 +221,32 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 	在eventpoll_init中对epoll_watches进行了赋值, 可以占用整个用户空间的4%*/
 	if (unlikely(atomic_read(&ep->user->epoll_watches) >=
 		     max_user_watches))
-		return -ENOSPC;
+		......
 
 
+	/*epi申请空间, epi为红黑树需要的节点描述结构体,里面包含节点结构, 每个节点对应一个监听套接字*/
 	if (!(epi = kmem_cache_alloc(epi_cache, GFP_KERNEL)))
-		return -ENOMEM;
+		......
 
-	/* Item initialization follow here ... */
+	/*初始化epi里面的几个列表*/
 	INIT_LIST_HEAD(&epi->rdllink);
 	INIT_LIST_HEAD(&epi->fllink);
 	INIT_LIST_HEAD(&epi->pwqlist);
-	epi->ep = ep;
-	ep_set_ffd(&epi->ffd, tfile, fd);
-	epi->event = *event;
-	epi->nwait = 0;
-	epi->next = EP_UNACTIVE_PTR;
 
-	/* Initialize the poll table using the queue callback */
+	/*对epi的其他元素进行初始化*/
+	epi->ep = ep;
+	/*填充ffd, 存储fd和file结构体*/
+	ep_set_ffd(&epi->ffd, tfile, fd);
+
+	/*保存传入的event结构, 当有数据来临时, 对应的event结构会通过结构数组形式传递出去
+		结构中主要有两个元素ev.events = EPOLLIN | EPOLLET;
+				    ev.data.fd */
+	epi->event = *event;
+
+	epi->nwait = 0;
+	epi->next = EP_UNACTIVE_PTR; /*next 指针初始化为NULL*/
+
+	/* */
 	epq.epi = epi;
 	init_poll_funcptr(&epq.pt, ep_ptable_queue_proc);
 
