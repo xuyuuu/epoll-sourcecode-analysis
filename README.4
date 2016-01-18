@@ -29,6 +29,7 @@ __wake_up_common
 {
 	遍历sock结构中的sk_sleep上的task_list循环链表, 当当前的套接字缓冲区有数据时,需要遍历注册到该sk_sleep上的
 	所有的监听事件.
+
 	list_for_each_entry_safe(curr, next, &q->task_list, task_list) {
 
 		执行每一个wait_queue_t结构中的func函数, func函数也是在epoll_ctl中进行初始化的.
@@ -39,7 +40,27 @@ __wake_up_common
 
 ep_poll_callback
 {
-	......	
+	从sk_sleep上得到每一个wait_queue_t结构,
+	从wait_queue_t结构可以得到包含该结构的eppoll_entry结构.
+	eppoll_entry是由对应的wait_queue_t和epitem结构组成的.
 
+	struct epitem *epi = ep_item_from_wait(wait);
+
+
+	匹配chain上的每一个epitem里面的events类型(EPOLLIN, EPOLLOUT, EPOLLET,EPOLLLT)是否跟key匹配.
+	key里的类型为POLLIN类型.
+	if (key && !((unsigned long) key & epi->event.events))
+		goto out_unlock;
 
 }
+
+
+
+
+
+
+
+
+
+
+
