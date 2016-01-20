@@ -262,14 +262,8 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 
 }
 
-ep_remove是删除操作
-
-{
-	
-}
-
-ep_modify是状态集修改操作
-
+ep_remove和ep_modify操作和插入操作大同小异, 此处不只做具体分析.
+其中ep_modify更改了事件状态之后, 会即刻唤醒沉睡的epoll_wait函数.
 
 
 
