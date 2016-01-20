@@ -58,10 +58,11 @@ static int ep_alloc(struct eventpoll **pep)
 	/*初始化就绪队列*/
 	INIT_LIST_HEAD(&ep->rdllist);
 
-	/* epoll的底层数据结构红黑树 */
+	/* epoll的底层数据结构红黑树, 红黑树的主要作用是进行ep_find操作,
+	 * 用户快速查找事件是否已监听, 或快速的修改监听事件的状态集 */
 	ep->rbr = RB_ROOT;
 
-	/**/
+	/* ovflist初始化, ovflist将在内核触发通知和epoll_wait中说明*/
 	ep->ovflist = EP_UNACTIVE_PTR;
 
 	/* 创建epoll的用户结构体*/
@@ -137,3 +138,5 @@ void fd_install(unsigned int fd, struct file *file)
 	/*将对应的struct file结构体指针插入到fd表中*/
 	rcu_assign_pointer(fdt->fd[fd], file);
 }
+
+epoll_create系统调用主要作用就是创建了一个eventpoll全局结构, 并将在epoll_ctl和epoll_wait中起作用.
