@@ -1,0 +1,274 @@
+|******************************************************************|
+|*****			epoll_ctl                      ************|
+|******************************************************************|
+epoll_ctl主要是将其他的需要监听的套接字加入到epoll_create创建的监听事件中去
+针对在epoll_ctl函数中添加的套接字类型是否具有poll函数指针一说, 可在下面进行分析.
+static int sock_attach_fd(struct socket *sock, struct file *file, int flags)
+{
+	......
+
+	/*此处使用了socket_file_ops结构体,该结构体就可以使用epoll和poll函数*/
+	init_file(file, sock_mnt, dentry, FMODE_READ | FMODE_WRITE,
+		  &socket_file_ops);
+	SOCK_INODE(sock)->i_fop = &socket_file_ops;
+
+	......
+}
+
+以上的sock_attach_fd是在socket系统调用源码中调用的, 此处赋值的是socket_file_ops结构体, socket_file_ops结构体如下：
+static const struct file_operations socket_file_ops = {
+	......
+
+	.poll =		sock_poll,
+
+	......
+};
+在该结构体中对poll函数进行了赋值, 既为sock_poll. 由此看出socket生成的fd是可以正常添加进epoll_ctl函数中的.
+而在系统调用open中,调用__dentry_open函数.
+static struct file *__dentry_open(struct dentry *dentry, struct vfsmount *mnt,
+					int flags, struct file *f,
+					int (*open)(struct inode *, struct file *),
+					const struct cred *cred)
+{
+	......
+
+	/*file结构体中的f_op是从inode结构体中的i_fop元素赋值过来的,inode结构中的i_fop一般跟文件系统类型相关*/
+	f->f_op = fops_get(inode->i_fop);
+
+	......
+}
+以ext3文件系统为例, ext3的file_operations结构体如下
+const struct file_operations ext3_file_operations = {
+	.llseek		= generic_file_llseek,
+	.read		= do_sync_read,
+	.write		= do_sync_write,
+	.aio_read	= generic_file_aio_read,
+	.aio_write	= generic_file_aio_write,
+	.unlocked_ioctl	= ext3_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= ext3_compat_ioctl,
+#endif
+	.mmap		= generic_file_mmap,
+	.open		= generic_file_open,
+	.release	= ext3_release_file,
+	.fsync		= ext3_sync_file,
+	.splice_read	= generic_file_splice_read,
+	.splice_write	= generic_file_splice_write,
+};
+该结构体中没有poll函数的支持,则一般的open产生的跟具体磁盘inode相关的fd描述符是不能添加进epoll_ctl中的.
+
+接下来正式分析epoll_ctl函数.
+SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
+		struct epoll_event __user *, event)
+{
+	struct file *file, *tfile;
+	struct eventpoll *ep;
+	struct epitem *epi;
+	struct epoll_event epds;
+
+	/*ep_op_has_event里面主要用来判断op类型是否为EPOLL_CTL_DEL
+	  要是delete类型的话, 就不用对参数epoll_event进行拷贝了,否则需要拷贝到内核结构体中*/
+	if (ep_op_has_event(op) &&
+	    copy_from_user(&epds, event, sizeof(struct epoll_event)))
+		.......
+
+	/* 从epoll_create创建的fd中, 获取其对应的file结构体  */
+	file = fget(epfd);
+	......
+
+	/*拿到参数中传入的添加fd对应的file结构体*/
+	tfile = fget(fd);
+
+	/*判断该file类型是否有f_op操作, 同时是否是具有poll函数, 对于普通的文件套接字, 在此处报错*/
+	if (!tfile->f_op || !tfile->f_op->poll)
+		goto ...... 
+
+	/* 如果加入到主监听fd(epoll_create创建的)中的是他本身, 则加入失败  */
+	if (file == tfile || !is_file_epoll(file))
+		goto .......
+
+	/*拿到eventpoll结构体*/
+	ep = file->private_data;
+
+	/*在红黑树中查找即将监听的fd, 看是否已经存在*/
+	epi = ep_find(ep, tfile, fd);
+
+	switch (op) {
+	case EPOLL_CTL_ADD:
+		/*如果已经存在, 并且操作时添加操作, 就不用再添加到红黑树中了*/
+		if (!epi) {
+			epds.events |= POLLERR | POLLHUP;
+			/*不存在的的时候执行插入红黑树的操作*/
+			error = ep_insert(ep, &epds, tfile, fd);
+		} else
+			error = -EEXIST;
+		break;
+	case EPOLL_CTL_DEL:
+		/*如果是删除操作, 红黑树中已经存在, 则直接进行删除*/
+		if (epi)
+			error = ep_remove(ep, epi);
+		/*不存在于红黑树中, 无需进行删除*/
+		else
+			error = -ENOENT;
+		break;
+	case EPOLL_CTL_MOD:
+		/*如果已经存在, 则进行更改*/
+		if (epi) {
+			epds.events |= POLLERR | POLLHUP;
+			error = ep_modify(ep, epi, &epds);
+		} else
+			error = -ENOENT;
+		break;
+	}
+		
+	......
+}
+
+传递给ep_find函数的第二个参数是待监听的fd的file结构体指针, 第三个参数是待监听的fd.
+其中ep_find中主要涉及到的结构体如下:
+struct epoll_filefd {
+	struct file *file;
+	int fd;
+};
+
+/*红黑树的节点*/
+struct rb_node
+{
+	unsigned long  rb_parent_color;
+#define	RB_RED		0
+#define	RB_BLACK	1
+	struct rb_node *rb_right;/*左孩子指针*/
+	struct rb_node *rb_left;/*右孩子指针*/
+} __attribute__((aligned(sizeof(long))));
+
+/*红黑树的根节点*/
+struct rb_root
+{
+	struct rb_node *rb_node;
+};
+
+ep_find主要用来查找当前插入的fd套接字是否已经在epoll监听的红黑树中.
+static struct epitem *ep_find(struct eventpoll *ep, struct file *file, int fd)
+{
+	int kcmp;
+	struct rb_node *rbp;
+	struct epitem *epi, *epir = NULL;
+	struct epoll_filefd ffd;
+
+	ep_set_ffd(&ffd, file, fd);
+	/*遍历红黑树,*/
+	for (rbp = ep->rbr.rb_node; rbp; ) {
+		epi = rb_entry(rbp, struct epitem, rbn);
+		/*红黑树中的比较函数, 以file结构体指针和fd大小进行比较*/
+		kcmp = ep_cmp_ffd(&ffd, &epi->ffd);
+		if (kcmp > 0)
+			rbp = rbp->rb_right;
+		else if (kcmp < 0)
+			rbp = rbp->rb_left;
+		else {
+			/*在红黑树中找到了要插入的fd套接字*/
+			epir = epi;
+			break;
+		}
+	}
+
+	return epir;
+}
+
+
+ep_insert是插入操作, 插入操作主要是将事件epi插入到红黑树一份, 用于快速查找.
+同时插入到每个套接字的sk_sleep中一份, 用于套接字数据到来时候, 进行通知.
+static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
+		     struct file *tfile, int fd)
+{
+	......
+
+	将函数地址ep_ptable_queue_proc赋值给epq(struct ep_pqueue)中的函数指针, 该函数指针主要在下面的f_op->poll中调用.
+	init_poll_funcptr(&epq.pt, ep_ptable_queue_proc);
+
+	运行tfile->f_op->poll函数, 返回当前待插入的事件对应的套接字的状态集.
+	f_op->poll主要调用了sock_poll函数.
+	sock_poll函数主要调用了sock->ops->poll函数.
+	sock->ops->poll函数根据不同的协议有对应的函数.
+	以tcp_poll函数为例:
+	-----------------------------------------------------------
+		tcp_poll{
+
+			调用了上文init_poll_funcptr中赋值进去的ep_ptable_queue_proc函数.
+			ep_ptable_queue_proc函数是内核触发功能的核心函数, 
+			该函数将加入epoll监听中的事件挂载到了对应的网络套接字的sk_sleep上.
+			sock_poll_wait(file, sk->sk_sleep, wait);
+
+				----------------------------------------------------------------
+					ep_ptable_queue_proc{
+						挂载到sk_sleep上的节点结构
+						struct eppoll_entry *pwq;
+
+						......
+
+						给wait_queue_t结构中的func函数指针赋值, ep_poll_callback将会在内核触发的时候使用.
+						ep_poll_callback函数的分析在内核触发那块进行.
+						init_waitqueue_func_entry(&pwq->wait, ep_poll_callback);
+
+						针对eppoll_entry各种初始化
+						pwq->whead = whead;
+						pwq->base = epi;
+
+						此处的whead是通过ep_ptable_queue_proc参数传递进来的, 实参既为sock结构中的sk_sleep元素.
+						这里将套接字结构与监听事件联系在了一起.
+						add_wait_queue(whead, &pwq->wait);
+
+						......
+
+						将poll使用的eppoll_entry结构挂在到epi的pwqlist元素上
+						list_add_tail(&pwq->llink, &epi->pwqlist);
+						epi->nwait++;
+	
+						......
+					}
+				----------------------------------------------------------------
+
+			接下来就是获取当前套机子的状态, 此处不做分析
+			.......
+		}
+	-----------------------------------------------------------
+	revents = tfile->f_op->poll(tfile, &epq.pt);
+
+	将当前epi事件插入到红黑树中.
+	ep_rbtree_insert(ep, epi);
+
+	......
+
+	如果刚刚通过epoll_ctl插入的事件已经满足条件(就绪)
+	if ((revents & event->events) && !ep_is_linked(&epi->rdllink)) {
+
+		将该事件挂载到eventpoll的就绪事件链表中去, 供epoll_wait使用.
+		list_add_tail(&epi->rdllink, &ep->rdllist);
+
+		如果此时已经有epoll_wait在监听该eventpoll, 并处于沉睡状态.
+		则调用ep->wq上注册的default_wake_function函数进行epoll_wait唤醒,
+		让epoll_wait继续执行for(;;)循环, 关于default_wake_function的说明在内核触发上也有提到.
+		if (waitqueue_active(&ep->wq))
+			wake_up_locked(&ep->wq);
+
+		......
+	}
+
+	......
+
+	要是当前epi事件已经挂在到了eventpoll的rdllist上, 则进行剥离, 避免重复挂载.
+	if (ep_is_linked(&epi->rdllink))
+		list_del_init(&epi->rdllink);	
+
+}
+
+ep_remove和ep_modify操作和插入操作大同小异, 此处不只做具体分析.
+其中ep_modify更改了事件状态之后, 会即刻唤醒沉睡的epoll_wait函数.
+
+
+
+
+
+
+
+
