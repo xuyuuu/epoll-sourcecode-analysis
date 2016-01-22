@@ -36,8 +36,14 @@ __wake_up_common
 	list_for_each_entry_safe(curr, next, &q->task_list, task_list) {
 
 		执行每一个wait_queue_t结构中的func函数, func函数也是在epoll_ctl中进行初始化的.
-		此处的func函数对应的函数为ep_poll_callback.
-		curr->func()	
+		此处的func函数对应的函数为ep_poll_callback, 当func函数为default_wake_function时,
+		WQ_FLAG_EXCLUSIVE可用于内核防止wake惊群使用.此处的func函数对应ep_poll_callback.
+		做惊群使用时, 每个epoll_wait的时候, 会生成一个wait结构, 挂载到ep->wq链表上.
+		既多个epoll_wait共同进行时,ep->wq会挂在多个节点,
+		但是wake唤醒的时候遇到WQ_FLAG_EXCLUSIVE标记退出, 则只唤醒了第一个.
+		if (curr->func(curr, mode, wake_flags, key) &&
+				(flags & WQ_FLAG_EXCLUSIVE) &&
+				!--nr_exclusive)
 	}	
 }
 

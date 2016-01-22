@@ -24,6 +24,11 @@ static int ep_poll(struct eventpoll *ep, struct epoll_event __user *events,
 {
 	......
 
+	针对每个epoll_wait初始化一个wait(wait_queue_t)结构,并将其flags设置为WQ_FLAG_EXCLUSIVE.
+	WQ_FLAG_EXCLUSIVE标记主要用于内核惊群唤醒时使用, 具体配合使用见内核触发分析.
+	init_waitqueue_entry(&wait, current);
+	wait.flags |= WQ_FLAG_EXCLUSIVE;
+
 	将wait(wait_queue_t结构)加入到eventpoll的wq链表元素上, 主要在内核唤醒时使用
 	__add_wait_queue(&ep->wq, &wait)
 
